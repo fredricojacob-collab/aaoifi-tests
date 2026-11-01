@@ -1,0 +1,41 @@
+name: AAOIFI testlarini yuborish
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # har soat boshida (UTC); GitHub ba'zan 5-20 daqiqa kechiktiradi
+  workflow_dispatch:       # Actions sahifasidan qo'lda ishga tushirish uchun
+
+permissions:
+  contents: write          # state.json ni saqlash uchun
+
+concurrency:
+  group: aaoifi-poster
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Navbatdagi testlarni yuborish
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID || '@AAOIFItests' }}
+          BATCH_SIZE: ${{ vars.BATCH_SIZE || '20' }}
+          REPEAT: ${{ vars.REPEAT || '1' }}
+        run: python poster.py --once
+
+      - name: Holatni saqlash
+        if: always()
+        run: |
+          git config user.name "aaoifi-bot"
+          git config user.email "aaoifi-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "state: $(python -c 'import json;print(json.load(open("state.json"))["next"])') sent"
+          git push
