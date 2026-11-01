@@ -133,44 +133,57 @@ def build_poll(item, rnd=0):
     return payload
 
 
+def sent_ids_of(state, questions):
+    """Yuborilgan testlar ID ro'yxati. Eski state.json (faqat "next") bo'lsa,
+    fayldagi birinchi "next" ta test yuborilgan deb hisoblanadi."""
+    if "sent_ids" not in state:
+        state["sent_ids"] = [q["id"] for q in questions[:state.get("next", 0)]]
+    return state["sent_ids"]
+
+
 def send_batch(questions, state, n, dry_run=False):
-    if state["next"] >= len(questions):
+    sent = sent_ids_of(state, questions)
+    done = set(sent)
+    pending = [q for q in questions if q["id"] not in done]
+    if not pending:
         if not REPEAT:
             log(f"Test banki tugadi: {len(questions)} ta testning hammasi yuborilgan.")
             return 0
         state["round"] = state.get("round", 0) + 1
+        state["sent_ids"] = sent = []
         state["next"] = 0
+        pending = list(questions)
         log(f"Bank tugadi, {state['round'] + 1}-aylanish boshlandi (variantlar o'rni almashtirildi).")
         if not dry_run:
             save_state(state)
-    start = state["next"]
     rnd = state.get("round", 0)
-    batch = questions[start:start + n]
-    sent = 0
+    batch = pending[:n]
+    log(f"Bank: {len(questions)} ta, yuborilgan: {len(sent)}. Bu safar standartlar: "
+        + ", ".join(str(q["standard"]) for q in batch) + (f" | belgi: {POLL_TAG}" if POLL_TAG else ""))
+    count = 0
     for i, item in enumerate(batch):
         payload = build_poll(item, rnd)
         if dry_run:
             letters = "ABCD"
-            print(f"\n#{start + i + 1} {payload['question']}")
+            print(f"\n#{len(sent) + i + 1} {payload['question']}")
             for k, o in enumerate(payload["options"]):
-                o = o["text"]
                 mark = "  <-- to'g'ri" if k == payload["correct_option_id"] else ""
-                print(f"   {letters[k]}) {o}{mark}")
-            sent += 1
+                print(f"   {letters[k]}) {o['text']}{mark}")
+            count += 1
             continue
         api("sendPoll", payload)
-        sent += 1
-        # har bir muvaffaqiyatli yuborishdan keyin holatni saqlaymiz,
-        # shunda uzilish bo'lsa ham test qayta yuborilmaydi
-        state["next"] = start + sent
+        count += 1
+        # har bir muvaffaqiyatli yuborishdan keyin holatni saqlaymiz
+        sent.append(item["id"])
+        state["next"] = len(sent)
         state["sent_total"] = state.get("sent_total", 0) + 1
         state["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         save_state(state)
         if i < len(batch) - 1:
             time.sleep(PAUSE_BETWEEN_POLLS)
     if not dry_run:
-        log(f"{sent} ta test yuborildi ({state['next']}/{len(questions)}).")
-    return sent
+        log(f"{count} ta test yuborildi ({len(sent)}/{len(questions)}).")
+    return count
 
 
 def main():
@@ -187,6 +200,7 @@ def main():
     state = load_state()
 
     if args.status:
+        state["next"] = len(sent_ids_of(state, questions))
         left = len(questions) - state["next"]
         hours = -(-left // BATCH_SIZE)
         print(f"Aylanish: {state.get('round', 0) + 1} | Jami: {len(questions)} | yuborilgan: {state['next']} | qolgan: {left} "
@@ -194,7 +208,8 @@ def main():
         return
 
     if args.test:
-        item = questions[min(state["next"], len(questions) - 1)]
+        done = set(sent_ids_of(state, questions))
+        item = next((q for q in questions if q["id"] not in done), questions[0])
         payload = build_poll(item, state.get("round", 0))
         payload["question"] = ("[TEST] " + payload["question"])[:MAX_Q]
         res = api("sendPoll", payload)
@@ -209,7 +224,7 @@ def main():
         log(f"Doimiy rejim: har soatda {BATCH_SIZE} ta test -> {CHAT_ID}. To'xtatish: Ctrl+C")
         while True:
             state = load_state()
-            if state["next"] >= len(questions) and not REPEAT:
+            if len(sent_ids_of(state, questions)) >= len(questions) and not REPEAT:
                 log("Test banki tugadi, skript to'xtadi.")
                 return
             try:
