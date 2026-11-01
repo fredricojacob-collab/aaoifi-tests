@@ -40,6 +40,9 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "@AAOIFItests").strip()
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
 # bank tugaganda boshidan qayta boshlash (1 = ha, 0 = to'xtash)
 REPEAT = os.environ.get("REPEAT", "1").strip() not in ("0", "false", "no", "")
+# Har bir test ostida ko'rinadigan belgi (boshqa botlarnikidan ajratish uchun).
+# O'zgartirish: shu qatordagi matnni almashtiring yoki POLL_TAG o'zgaruvchisini bering; "" = belgisiz.
+POLL_TAG = os.environ.get("POLL_TAG", "\U0001F916 Claude")
 PAUSE_BETWEEN_POLLS = 3.5  # soniya; kanalga daqiqasiga ~20 xabar chegarasidan oshmaslik uchun
 
 # Telegram quiz poll chegaralari
@@ -112,7 +115,12 @@ def rotate(item, rnd):
 
 def build_poll(item, rnd=0):
     question = f"[SS {item['standard']}] {item['q']}"
+    if POLL_TAG:
+        question = f"{question}\n\n{POLL_TAG}"
     options, answer = rotate(item, rnd)
+    explanation = item["explanation"]
+    if POLL_TAG and len(explanation) + len(POLL_TAG) + 5 <= MAX_EXPL:
+        explanation = f"{explanation}\n\n{POLL_TAG}"
     payload = {
         "chat_id": CHAT_ID,
         "question": question[:MAX_Q],
@@ -120,7 +128,7 @@ def build_poll(item, rnd=0):
         "type": "quiz",
         "correct_option_id": answer,
         "is_anonymous": True,
-        "explanation": item["explanation"][:MAX_EXPL],
+        "explanation": explanation[:MAX_EXPL],
     }
     return payload
 
