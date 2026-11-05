@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
 """
-AAOIFI testlarini Telegram kanaliga quiz poll ko'rinishida yuboruvchi skript.
+AAOIFI testlarini (CPSS uslubi) Telegram kanaliga yuboruvchi skript.
 
-Har ishga tushganda navbatdagi BATCH_SIZE ta testni yuboradi va qayerda
-to'xtaganini state.json faylida saqlaydi.
+Har ishga tushganda navbatdagi BATCH_SIZE ta testni yuboradi va qaysilari
+yuborilganini state.json faylida (test ID raqamlari bo'yicha) saqlaydi.
+
+Ko'rinish:
+  * Qisqa test (savol va variantlar Telegram poll'iga sig'sa) -> bitta quiz poll,
+    variantlar to'liq matn bilan.
+  * Uzun test -> avval CPSS mock ko'rinishidagi xabar (Question: N, A. B. C. D.),
+    so'ng unga javob tariqasida A/B/C/D (yoki True/False) tugmali quiz poll.
 
 Ishlatish:
-  python poster.py --once        # navbatdagi 20 ta testni yuboradi (GitHub Actions / cron uchun)
-  python poster.py --loop        # to'xtovsiz ishlaydi: har soatda 20 ta (kompyuter/server uchun)
-  python poster.py --test        # kanalga bitta sinov testi yuboradi (holat o'zgarmaydi)
-  python poster.py --status      # nechta yuborilgan / qolganini ko'rsatadi
-  python poster.py --once --dry-run   # yubormasdan nima yuborilishini ko'rsatadi
+  python poster.py --once        # navbatdagi to'plam (GitHub Actions uchun)
+  python poster.py --loop        # to'xtovsiz, har soatda (kompyuter/server uchun)
+  python poster.py --test        # bitta sinov testi (holat o'zgarmaydi)
+  python poster.py --status      # nechta yuborilgan / qolgan
+  python poster.py --once --dry-run   # yubormasdan ko'rsatish
 
-Sozlamalar (muhit o'zgaruvchilari):
+Muhit o'zgaruvchilari:
   TELEGRAM_BOT_TOKEN   @BotFather bergan token (MAJBURIY, kodga yozmang)
   TELEGRAM_CHAT_ID     kanal, standart: @AAOIFItests
   BATCH_SIZE           bir martada nechta test, standart: 20
   REPEAT               bank tugasa boshidan boshlash: 1 (standart) yoki 0
-  TELEGRAM_API_BASE    o'zgartirmang (standart: https://api.telegram.org)
-
-Faqat Python 3.8+ standart kutubxonasi ishlatiladi, hech narsa o'rnatish shart emas.
+  POLL_TAG             har test tagidagi belgi, standart: "🤖 Claude" ("" = belgisiz)
 """
 import argparse
+import html
 import json
 import os
 import sys
@@ -38,15 +43,17 @@ API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstri
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "@AAOIFItests").strip()
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
-# bank tugaganda boshidan qayta boshlash (1 = ha, 0 = to'xtash)
 REPEAT = os.environ.get("REPEAT", "1").strip() not in ("0", "false", "no", "")
-# Har bir test ostida ko'rinadigan belgi (boshqa botlarnikidan ajratish uchun).
-# O'zgartirish: shu qatordagi matnni almashtiring yoki POLL_TAG o'zgaruvchisini bering; "" = belgisiz.
 POLL_TAG = os.environ.get("POLL_TAG", "\U0001F916 Claude")
-PAUSE_BETWEEN_POLLS = 3.5  # soniya; kanalga daqiqasiga ~20 xabar chegarasidan oshmaslik uchun
+PAUSE = 3.5  # soniya, har bir xabardan keyin (kanal uchun daqiqasiga ~20 xabar chegarasi)
 
-# Telegram quiz poll chegaralari
+# Telegram chegaralari (UTF-16 birliklarida hisoblanadi)
 MAX_Q, MAX_OPT, MAX_EXPL = 300, 100, 200
+LETTERS = "ABCD"
+
+
+def u16(s):
+    return len(s.encode("utf-16-le")) // 2
 
 
 def log(msg):
@@ -61,11 +68,19 @@ def load_questions():
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {"next": 0, "round": 0, "sent_total": 0, "last_run": None}
+            st = json.load(f)
+    else:
+        st = {}
+    st.setdefault("sent_ids", [])
+    st.setdefault("round", 0)
+    st.setdefault("qno", 0)
+    st.setdefault("sent_total", 0)
+    st.setdefault("last_run", None)
+    return st
 
 
 def save_state(state):
+    state["next"] = len(state["sent_ids"])
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
@@ -96,7 +111,6 @@ def api(method, payload, retries=5):
             if 500 <= e.code < 600:
                 time.sleep(5 * (attempt + 1))
                 continue
-            # 400/403 va boshqalar - qayta urinishdan foyda yo'q
             raise RuntimeError(f"Telegram xatosi {e.code}: {info.get('description')}")
         except (urllib.error.URLError, TimeoutError) as e:
             log(f"Tarmoq xatosi: {e}; qayta urinish")
@@ -104,116 +118,148 @@ def api(method, payload, retries=5):
     raise RuntimeError(f"{method}: {retries} urinishdan keyin ham bo'lmadi")
 
 
-def rotate(item, rnd):
-    """Qayta aylanishda variantlar o'rnini siljitamiz, javoblar takrorlanmasin."""
+def options_for(item, rnd):
+    """Variantlar va to'g'ri javob indeksi. Qayta aylanishda o'rni almashtiriladigan
+    (fixed_order bo'lmagan) testlarda variantlar siljitiladi."""
+    if item["type"] == "tf":
+        return ["True", "False"], int(item["answer"])
+    opts = list(item["options"])
+    ans = int(item["answer"])
     r = rnd % 4
-    opts = item["options"]
-    options = opts[-r:] + opts[:-r] if r else list(opts)
-    answer = (int(item["answer"]) + r) % 4
-    return options, answer
+    if r and not item.get("fixed_order"):
+        opts = opts[-r:] + opts[:-r]
+        ans = (ans + r) % 4
+    return opts, ans
 
 
-def build_poll(item, rnd=0):
-    question = f"[SS {item['standard']}] {item['q']}"
+def explanation_text(item):
+    expl = item.get("explanation", "")
+    if POLL_TAG and u16(expl) + u16(POLL_TAG) + 2 <= MAX_EXPL:
+        expl = f"{expl}\n\n{POLL_TAG}"
+    while u16(expl) > MAX_EXPL:
+        expl = expl[:-1]
+    return expl
+
+
+def plan(item, qno, rnd):
+    """Bitta test uchun Telegram'ga yuboriladigan xabar(lar)."""
+    opts, ans = options_for(item, rnd)
+    tag = f"\n\n{POLL_TAG}" if POLL_TAG else ""
+    single_q = f"Question {qno}: {item['stem']}{tag}"
+    fits = u16(single_q) <= MAX_Q and all(u16(o) <= MAX_OPT for o in opts)
+    poll = {"chat_id": CHAT_ID, "type": "quiz", "is_anonymous": True,
+            "correct_option_id": ans, "explanation": explanation_text(item)}
+    if fits:
+        poll.update(question=single_q, options=[{"text": o} for o in opts])
+        return None, poll
+    # uzun test: CPSS ko'rinishidagi matn + harfli poll
+    labels = ["True", "False"] if item["type"] == "tf" else list(LETTERS)
+    lines = [f"<b>Question: {qno}</b>", "", html.escape(item["stem"], quote=False), ""]
+    for k, o in enumerate(opts):
+        lines.append(f"<b>{LETTERS[k]}.</b> {html.escape(o, quote=False)}")
+        if item["type"] != "tf":
+            lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
     if POLL_TAG:
-        question = f"{question}\n\n{POLL_TAG}"
-    options, answer = rotate(item, rnd)
-    explanation = item["explanation"]
-    if POLL_TAG and len(explanation) + len(POLL_TAG) + 5 <= MAX_EXPL:
-        explanation = f"{explanation}\n\n{POLL_TAG}"
-    payload = {
-        "chat_id": CHAT_ID,
-        "question": question[:MAX_Q],
-        "options": [{"text": o[:MAX_OPT]} for o in options],
-        "type": "quiz",
-        "correct_option_id": answer,
-        "is_anonymous": True,
-        "explanation": explanation[:MAX_EXPL],
-    }
-    return payload
+        lines += ["", html.escape(POLL_TAG, quote=False)]
+    text = "\n".join(lines).strip()
+    msg = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+           "link_preview_options": {"is_disabled": True}}
+    poll.update(question=f"Question {qno}: choose the correct answer",
+                options=[{"text": l} for l in labels])
+    return msg, poll
 
 
-def sent_ids_of(state, questions):
-    """Yuborilgan testlar ID ro'yxati. Eski state.json (faqat "next") bo'lsa,
-    fayldagi birinchi "next" ta test yuborilgan deb hisoblanadi."""
-    if "sent_ids" not in state:
-        state["sent_ids"] = [q["id"] for q in questions[:state.get("next", 0)]]
-    return state["sent_ids"]
+def pending_items(questions, state):
+    done = set(state["sent_ids"])
+    return [q for q in questions if q["id"] not in done]
 
 
 def send_batch(questions, state, n, dry_run=False):
-    sent = sent_ids_of(state, questions)
-    done = set(sent)
-    pending = [q for q in questions if q["id"] not in done]
+    pending = pending_items(questions, state)
     if not pending:
         if not REPEAT:
             log(f"Test banki tugadi: {len(questions)} ta testning hammasi yuborilgan.")
             return 0
-        state["round"] = state.get("round", 0) + 1
-        state["sent_ids"] = sent = []
-        state["next"] = 0
+        state["round"] += 1
+        state["sent_ids"] = []
         pending = list(questions)
-        log(f"Bank tugadi, {state['round'] + 1}-aylanish boshlandi (variantlar o'rni almashtirildi).")
+        log(f"Bank tugadi, {state['round'] + 1}-aylanish boshlandi.")
         if not dry_run:
             save_state(state)
-    rnd = state.get("round", 0)
+    rnd = state["round"]
     batch = pending[:n]
-    log(f"Bank: {len(questions)} ta, yuborilgan: {len(sent)}. Bu safar standartlar: "
+    log(f"Bank: {len(questions)} ta, yuborilgan: {len(state['sent_ids'])}. Bu safar standartlar: "
         + ", ".join(str(q["standard"]) for q in batch) + (f" | belgi: {POLL_TAG}" if POLL_TAG else ""))
     count = 0
     for i, item in enumerate(batch):
-        payload = build_poll(item, rnd)
+        qno = state["qno"] + 1
+        msg, poll = plan(item, qno, rnd)
         if dry_run:
-            letters = "ABCD"
-            print(f"\n#{len(sent) + i + 1} {payload['question']}")
-            for k, o in enumerate(payload["options"]):
-                mark = "  <-- to'g'ri" if k == payload["correct_option_id"] else ""
-                print(f"   {letters[k]}) {o['text']}{mark}")
+            if msg:
+                print("\n--- XABAR ---\n" + msg["text"])
+                print("--- POLL --- " + poll["question"] + " | " + "/".join(o["text"] for o in poll["options"])
+                      + f" | to'g'ri: {poll['options'][poll['correct_option_id']]['text']}")
+            else:
+                print("\n--- POLL ---\n" + poll["question"])
+                for k, o in enumerate(poll["options"]):
+                    print(f"   {LETTERS[k]}) {o['text']}" + ("  <-- to'g'ri" if k == poll["correct_option_id"] else ""))
+            state["qno"] = qno
             count += 1
             continue
-        api("sendPoll", payload)
+        if msg:
+            res = api("sendMessage", msg)
+            mid = res.get("result", {}).get("message_id")
+            if mid:
+                poll["reply_parameters"] = {"message_id": mid, "allow_sending_without_reply": True}
+            time.sleep(1.5)
+        api("sendPoll", poll)
         count += 1
-        # har bir muvaffaqiyatli yuborishdan keyin holatni saqlaymiz
-        sent.append(item["id"])
-        state["next"] = len(sent)
-        state["sent_total"] = state.get("sent_total", 0) + 1
+        state["sent_ids"].append(item["id"])
+        state["qno"] = qno
+        state["sent_total"] += 1
         state["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         save_state(state)
         if i < len(batch) - 1:
-            time.sleep(PAUSE_BETWEEN_POLLS)
+            time.sleep(PAUSE)
     if not dry_run:
-        log(f"{count} ta test yuborildi ({len(sent)}/{len(questions)}).")
+        log(f"{count} ta test yuborildi ({len(state['sent_ids'])}/{len(questions)}).")
     return count
 
 
 def main():
-    p = argparse.ArgumentParser(description="AAOIFI quiz poster")
+    p = argparse.ArgumentParser(description="AAOIFI CPSS-style quiz poster")
     g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--once", action="store_true", help="navbatdagi to'plamni yuborish")
-    g.add_argument("--loop", action="store_true", help="har soatda yuborib turish")
-    g.add_argument("--test", action="store_true", help="bitta sinov testi")
-    g.add_argument("--status", action="store_true", help="holatni ko'rsatish")
-    p.add_argument("--dry-run", action="store_true", help="yubormasdan ko'rsatish")
+    g.add_argument("--once", action="store_true")
+    g.add_argument("--loop", action="store_true")
+    g.add_argument("--test", action="store_true")
+    g.add_argument("--status", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
     questions = load_questions()
     state = load_state()
 
     if args.status:
-        state["next"] = len(sent_ids_of(state, questions))
-        left = len(questions) - state["next"]
+        left = len(pending_items(questions, state))
         hours = -(-left // BATCH_SIZE)
-        print(f"Aylanish: {state.get('round', 0) + 1} | Jami: {len(questions)} | yuborilgan: {state['next']} | qolgan: {left} "
-              f"(~{hours} soat, ~{hours / 24:.1f} kun) | oxirgi: {state.get('last_run')}")
+        print(f"Aylanish: {state['round'] + 1} | Jami: {len(questions)} | yuborilgan: {len(state['sent_ids'])} "
+              f"| qolgan: {left} (~{hours} soat, ~{hours / 24:.1f} kun) | oxirgi: {state.get('last_run')}")
         return
 
     if args.test:
-        done = set(sent_ids_of(state, questions))
-        item = next((q for q in questions if q["id"] not in done), questions[0])
-        payload = build_poll(item, state.get("round", 0))
-        payload["question"] = ("[TEST] " + payload["question"])[:MAX_Q]
-        res = api("sendPoll", payload)
-        log("Sinov testi yuborildi." if res.get("ok") else f"Javob: {res}")
+        pend = pending_items(questions, state) or questions
+        msg, poll = plan(pend[0], 0, state["round"])
+        poll["question"] = ("[TEST] " + poll["question"])[:MAX_Q]
+        if msg:
+            msg["text"] = "[TEST]\n" + msg["text"]
+            res = api("sendMessage", msg)
+            mid = res.get("result", {}).get("message_id")
+            if mid:
+                poll["reply_parameters"] = {"message_id": mid, "allow_sending_without_reply": True}
+        api("sendPoll", poll)
+        log("Sinov testi yuborildi.")
         return
 
     if args.once:
@@ -224,16 +270,15 @@ def main():
         log(f"Doimiy rejim: har soatda {BATCH_SIZE} ta test -> {CHAT_ID}. To'xtatish: Ctrl+C")
         while True:
             state = load_state()
-            if len(sent_ids_of(state, questions)) >= len(questions) and not REPEAT:
+            if not pending_items(questions, state) and not REPEAT:
                 log("Test banki tugadi, skript to'xtadi.")
                 return
             try:
                 send_batch(questions, state, BATCH_SIZE)
             except RuntimeError as e:
                 log(f"XATO: {e}")
-            # keyingi soat boshigacha kutish
-            now = time.time()
-            time.sleep(3600 - (now % 3600) + 5)
+            wait = (17 * 60 - time.time() % 3600) % 3600
+            time.sleep(wait if wait > 60 else wait + 3600)
 
 
 if __name__ == "__main__":
