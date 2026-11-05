@@ -132,13 +132,32 @@ def options_for(item, rnd):
     return opts, ans
 
 
+def source_line(item, with_title=True):
+    """Manba: standart raqami, nomi va band(lar)i."""
+    ref = (item.get("ref") or "").strip()
+    ref = ref.replace("Basis", "Shari'ah Basis").replace("Shari'ah Shari'ah", "Shari'ah")
+    head = f"\U0001F4D6 AAOIFI SS {item['standard']}"
+    if with_title and item.get("title"):
+        head += f" ({item['title']})"
+    return f"{head}, {ref}" if ref else head
+
+
 def explanation_text(item):
-    expl = item.get("explanation", "")
-    if POLL_TAG and u16(expl) + u16(POLL_TAG) + 2 <= MAX_EXPL:
-        expl = f"{expl}\n\n{POLL_TAG}"
-    while u16(expl) > MAX_EXPL:
-        expl = expl[:-1]
-    return expl
+    """Izoh: 1-qator manba (SS raqami va band), keyin qisqa izoh, oxirida belgi."""
+    body = item.get("explanation", "")
+    for with_title in (True, False):
+        src = source_line(item, with_title)
+        for tag in ((f"\n\n{POLL_TAG}" if POLL_TAG else ""), ""):
+            text = f"{src}\n{body}{tag}"
+            if u16(text) <= MAX_EXPL:
+                return text
+    # juda uzun bo'lsa: manba to'liq qoladi, izoh qisqartiriladi
+    src = source_line(item, False)
+    room = MAX_EXPL - u16(src) - 2
+    cut = body
+    while u16(cut) > room:
+        cut = cut[: cut.rfind(" ")] if " " in cut else cut[:-1]
+    return f"{src}\n{cut}\u2026"
 
 
 def plan(item, qno, rnd):
